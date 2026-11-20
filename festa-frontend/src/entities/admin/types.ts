@@ -1,0 +1,302 @@
+// 관리자 콘솔 계약의 FE 측 정본 (S15P21A604-828).
+//
+// 두 부류가 섞여 있다. **BE 구현이 정본인 것**(origin/develop backend user/Admin*Controller,
+// wallet/AdminWalletController, booth/AdminBoothPublicationController, survey/AdminEventSurveyController)과
+// 전부 BE 정본이다 — user/Admin*Controller·wallet/AdminWalletController·
+// booth/AdminBoothPublicationController·survey/AdminEventSurveyController(#217 5건 연결 완료).
+import type { WalletTransaction } from '../wallet/types';
+
+/** 내가 관리자인가 — `GET /users/me` 응답의 `admin`·`master` 칸(#217 1번).
+ *  **FE 가드는 UX 보조일 뿐이고 최종 판정은 매 요청 BE(AdminGuard)가 한다** — 토큰의 role 은
+ *  관리자도 MEMBER 라 FE 가 스스로 알 길이 없다. */
+export interface AdminCapability {
+  admin: boolean;
+  master: boolean;
+}
+
+/** GET /api/v1/admin/admins 원소 */
+export interface AdminView {
+  userId: number;
+  nickname: string;
+  /** 보호된 계정 — 강등·정지·코인 조정·부스 조치의 대상이 될 수 없다(MASTER_PROTECTED) */
+  master: boolean;
+}
+
+export type AccountStatus = 'ACTIVE' | 'SUSPENDED';
+
+/**
+ * 회원 검색 결과 한 행 — BE `AdminUserOperationService.AdminUserSummaryView` 와 같은 모양.
+ * `GET /api/v1/admin/users?query=&page=&size=` · `GET /api/v1/admin/users/{userId}`
+ */
+export interface AdminMemberView {
+  userId: number;
+  nickname: string;
+  status: AccountStatus | string;
+  admin: boolean;
+  master: boolean;
+  providers: string[];
+  joinedAt: string | null;
+}
+
+export interface Page<T> {
+  content: T[];
+  page: number;
+  size: number;
+  totalElements: number;
+  totalPages: number;
+}
+
+/** GET /api/v1/admin/users/{userId}/status-history 원소 (AccountStatusHistoryView) */
+export interface AccountStatusHistoryView {
+  userId: number;
+  previousStatus: AccountStatus | string;
+  currentStatus: AccountStatus | string;
+  reason: string | null;
+  /** 0 = 시스템(마이그레이션) */
+  actorUserId: number;
+  createdAt: string;
+}
+
+/** GET /api/v1/admin/wallets/{userId} */
+export interface AdminBalance {
+  userId: number;
+  balance: number;
+  updatedAt: string;
+}
+
+/** GET /api/v1/admin/wallets/{userId}/ledger 원소 — 회원 본인이 보는 원장과 같은 모양(CoinLedgerEntryView) */
+export type AdminLedgerEntry = WalletTransaction;
+
+/** POST /api/v1/admin/wallets/{userId}/adjustments 응답 */
+export interface AdjustmentResult {
+  userId: number;
+  entryId: number;
+  balanceAfter: number;
+  /** 같은 Idempotency-Key 로 이미 처리된 요청 — 이번에는 아무 일도 하지 않았다 */
+  alreadyApplied: boolean;
+}
+
+/**
+ * 관리자 부스 한 칸 — `GET /api/v1/admin/booths` 의 원소 (S15P21A604-951, GitLab #252).
+ *
+ * **관리자 부스만 나온다.** 회원 부스는 목록에 없다. 그리고 호출한 사람의 것만이 아니라 **모든
+ * 관리자의 부스**다 — 관리자 부스는 사람이 아니라 권한을 따라가므로(S15P21A604-905) 자리를 비웠거나
+ * 강등된 관리자의 부스도 남은 관리자가 이어서 운영한다.
+ *
+ * 종전에는 공개 `GET /booth-slots` 에서 OCCUPIED 만 추리고 `entryAvailable` 을 게시 여부의
+ * 근사치로 썼다. 그 목록은 관리자 부스와 회원 부스를 구분하지 못했고, `published` 가 지금은
+ * 서버가 직접 답하는 값이라 근사치가 필요 없다.
+ *
+ * **회원 부스도 온다** (GitLab #263, S15P21A604-959). 관리자 권한은 원래부터 남의 부스에 열려
+ * 있었고(`BoothAccessGuard`, spec 004 FR-023) 막혀 있던 것은 목록 하나뿐이었다 — 목록을 여는 것은
+ * 새 권한이 아니라 이미 있던 권한의 나머지 반쪽이다.
+ */
+export interface AdminBoothView {
+  boothId: number;
+  /** 자리를 회수당했거나 임대가 끝난 회원 부스는 자리가 없다 — 정렬에서 맨 뒤로 간다 */
+  slotId: number | null;
+  slotCode: string | null;
+  name: string;
+  published: boolean;
+  leaseStartedAt: string;
+  /** 설치한 관리자 닉네임. 운영 이력 추적용이라 비어 있을 수 있다 */
+  installedBy: string | null;
+  /**
+   * 관리자 부스 여부 (#263).
+   *
+   * **없으면 참으로 읽는다** — BE 가 이 필드를 싣기 전까지 목록에 오는 것은 관리자 부스뿐이라,
+   * 그 사이에도 행마다 조치가 갈리는 분기가 사실대로 동작한다.
+   */
+  adminOwned?: boolean;
+  /** 회원 부스의 임대 만료. 관리자 부스는 상설 임대라 null 이고(-905), 만료된 회원 부스도 null 이다 */
+  leaseEndsAt?: string | null;
+}
+
+// ── 이벤트 상점 — BE AdminEventShopController 정본(S15P21A604-853 에 연결) ──────────────────
+//
+// 코인 차감(원장)과 경품 지급은 **다른 사건**이다. 원장에 SPEND 가 남았다고 물건을 받은 것이 아니다.
+// 그래서 구매 한 건이 `ledgerEntryId`(돈) 와 `fulfillment`(물건) 를 따로 든다.
+
+/** 지급 처리 상태. 실제 지급 방식(현장 수령·추첨·사후 지급)이 갈리면 여기에 값이 늘어난다 */
+export type PrizeFulfillmentStatus = 'PURCHASED' | 'PENDING' | 'FULFILLED' | 'CANCELLED';
+
+/**
+ * 지금 상태에서 갈 수 있는 다음 상태 — BE `PurchaseFulfillment.canTransitionTo` 와 같은 표다
+ * (S15P21A604-853, GitLab #217 4번). 화면과 mock 이 같은 것을 봐야 mock 에서만 도는 흐름이 없다.
+ *
+ * **`FULFILLED` 와 `CANCELLED` 는 둘 다 종단이다.** 물건이 나갔거나 주문이 무효가 된 뒤에는 이
+ * 상태를 되감지 않고, 잘못은 코인 조정과 메모로 바로잡는다(BE 판단). 여기서 열어 두면 누를 수 있는
+ * 버튼이 서버에서만 409 로 거절당한다.
+ */
+export function nextFulfillmentOptions(current: PrizeFulfillmentStatus): PrizeFulfillmentStatus[] {
+  switch (current) {
+    case 'PURCHASED': return ['PENDING', 'FULFILLED', 'CANCELLED'];
+    case 'PENDING': return ['FULFILLED', 'CANCELLED'];
+    case 'FULFILLED': return [];
+    case 'CANCELLED': return [];
+  }
+}
+
+export interface PrizeView {
+  prizeId: number;
+  name: string;
+  priceCoin: number;
+  /** null = 무제한 */
+  stock: number | null;
+  active: boolean;
+  /** 응모 마감 시각(ISO-8601). 즉시교환 상품은 null (S15P21A604-951) */
+  closesAt: string | null;
+  /** 0 = 즉시교환, 1 이상 = 응모권이고 그 수만큼 당첨된다 */
+  winnerCount: number;
+  /** 추첨을 마친 시각. null 이면 아직 — 마감 전이거나 즉시교환이다 */
+  drawnAt: string | null;
+}
+
+/**
+ * 경품 등록·수정 본문 (`POST`/`PUT /api/v1/admin/event-shop/prizes`).
+ *
+ * 수정은 **덮어쓰기**다 — 보내지 않은 필드가 유지되지 않는다. 그래서 폼이 현재 값을 먼저 채우고
+ * 통째로 보낸다.
+ */
+export interface PrizeDraft {
+  name: string;
+  priceCoin: number;
+  /** 생략(null) = 무제한. 응모형이면 응모권 수다 */
+  stock: number | null;
+  active: boolean;
+  closesAt: string | null;
+  /** 0 이면 즉시교환. 1 이상이면 `stock` 이 있어야 하고 그 수를 넘을 수 없다(BE 검증) */
+  winnerCount: number;
+}
+
+export interface PrizePurchaseView {
+  purchaseId: number;
+  prizeId: number;
+  prizeName: string;
+  buyerUserId: number;
+  buyerNickname: string;
+  quantity: number;
+  coinSpent: number;
+  /** 원장 항목. null 이면 코인 차감이 확인되지 않은 것이다 */
+  ledgerEntryId: number | null;
+  purchasedAt: string;
+  fulfillment: PrizeFulfillmentStatus;
+  /** 마지막 처리 메모 */
+  note: string | null;
+  updatedAt: string;
+  /** 받는 자 정보 (GitLab #239, S15P21A604-912). #239 이전 행은 세 값이 함께 null 이다 */
+  campus: string | null;
+  teamName: string | null;
+  recipientName: string | null;
+  /**
+   * 추첨 결과 (S15P21A604-951, GitLab #251). `null` 이면 추첨 전이거나 응모형이 아니다 —
+   * 낙첨(`false`)과 구분해야 하므로 boolean 으로 접지 않는다.
+   */
+  won: boolean | null;
+}
+
+// ── 이벤트 설문 ─────────────────────────────────────────────────────────────────────────
+
+/** GET /api/v1/admin/event-surveys/{key}/entrants 원소 (EventEntrantView) — BE 정본 */
+export interface EventEntrantView {
+  responseId: number;
+  userId: number;
+  nickname: string;
+  submittedAt: string;
+}
+
+/**
+ * 공식 설문 요약 — BE `AdminEventSurveyService.EventSurveyView` 와 같은 모양.
+ * `GET /api/v1/admin/event-surveys`
+ */
+export interface EventSurveySummary {
+  surveyKey: string;
+  surveyId: number;
+  title: string;
+  closed: boolean;
+  rewardCoin: number;
+  questionCount: number;
+  entrantCount: number;
+}
+
+export type EventQuestionType = 'SINGLE_CHOICE' | 'MULTI_CHOICE' | 'RATING' | 'TEXT' | string;
+
+/** 질문별 집계 — BE `AdminEventSurveyService.QuestionAggregateView` 와 같은 모양.
+ *  `GET /api/v1/admin/event-surveys/{key}/aggregate` */
+export interface EventQuestionAggregate {
+  questionId: number;
+  prompt: string;
+  type: EventQuestionType;
+  answered: number;
+  /** 선택형·척도형 — 보기별 응답 수 */
+  options: { label: string; count: number }[];
+  /** 서술형 — 최근 응답 일부 */
+  textSamples: string[];
+}
+
+/** 개별 응답 — BE `AdminEventSurveyService.EventResponseView` 와 같은 모양.
+ *  `GET /api/v1/admin/event-surveys/{key}/responses/{responseId}` */
+export interface EventResponseDetail {
+  responseId: number;
+  userId: number;
+  nickname: string;
+  submittedAt: string;
+  answers: { questionId: number; prompt: string; value: string }[];
+}
+
+// ── 피드백 (S15P21A604-953) ────────────────────────────────────────────────
+//
+// 최초 발견 판정은 관리자가 목록을 읽고 손으로 고른다 — 자동 중복 판정 기준이 없어서다.
+// 보상 지급은 이 화면이 하지 않는다: 회원 관리·지갑 관리의 기존 코인 조정을 그대로 쓴다.
+
+/** GET /api/v1/admin/feedback 원소 — BE `FeedbackService.AdminFeedbackView` 와 같은 모양 */
+export interface FeedbackView {
+  feedbackId: number;
+  userId: number;
+  nickname: string | null;
+  content: string;
+  firstFound: boolean;
+  createdAt: string;
+}
+
+/**
+ * 콘솔이 쓰는 저장소 계약. real(api.ts)·mock(api.mock.ts) 이 둘 다 이 모양이라 화면은 어느 쪽인지 모른다.
+ * 새 기능이 BE 없이 들어올 때도 여기 시그니처를 먼저 세우고 mock 을 채운다 — UI 에 분기가 퍼지지 않게.
+ */
+export interface AdminRepository {
+  getCapability(): Promise<AdminCapability>;
+
+  listAdmins(): Promise<AdminView[]>;
+  promoteAdmin(userId: number, note?: string): Promise<AdminView>;
+  demoteAdmin(userId: number, note?: string): Promise<void>;
+
+  searchMembers(query: string, page: number, size: number): Promise<Page<AdminMemberView>>;
+  getMember(userId: number): Promise<AdminMemberView>;
+  suspendMember(userId: number, reason: string): Promise<void>;
+  unsuspendMember(userId: number): Promise<void>;
+  getStatusHistory(userId: number, page: number, size: number): Promise<Page<AccountStatusHistoryView>>;
+
+  getBalance(userId: number): Promise<AdminBalance>;
+  getLedger(userId: number, page: number, size: number): Promise<Page<AdminLedgerEntry>>;
+  adjustCoins(userId: number, idempotencyKey: string, signedAmount: number, note?: string): Promise<AdjustmentResult>;
+
+  listBooths(): Promise<AdminBoothView[]>;
+  unpublishBooth(boothId: number, reason: string): Promise<void>;
+
+  listPrizes(): Promise<PrizeView[]>;
+  createPrize(draft: PrizeDraft): Promise<PrizeView>;
+  updatePrize(prizeId: number, draft: PrizeDraft): Promise<PrizeView>;
+  /** `won` 은 응모 결과 필터다 — `null` 이면 전체, `true` 당첨만, `false` 낙첨만 */
+  listPurchases(status: PrizeFulfillmentStatus | 'ALL', page: number, size: number, won?: boolean | null): Promise<Page<PrizePurchaseView>>;
+  updateFulfillment(purchaseId: number, status: PrizeFulfillmentStatus, note?: string): Promise<PrizePurchaseView>;
+
+  listEventSurveys(): Promise<EventSurveySummary[]>;
+  getEventSurvey(surveyKey: string): Promise<EventSurveySummary>;
+  listEntrants(surveyKey: string, page: number, size: number): Promise<Page<EventEntrantView>>;
+  getEventAggregate(surveyKey: string): Promise<EventQuestionAggregate[]>;
+  getEventResponse(surveyKey: string, responseId: number): Promise<EventResponseDetail>;
+
+  listFeedback(page: number, size: number): Promise<Page<FeedbackView>>;
+  setFeedbackFirstFound(feedbackId: number, firstFound: boolean): Promise<FeedbackView>;
+}
+

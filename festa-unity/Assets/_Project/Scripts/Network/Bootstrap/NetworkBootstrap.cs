@@ -1,0 +1,217 @@
+using System;
+using Unity.Netcode;
+using Unity.Netcode.Transports.UTP;
+using UnityEngine;
+
+namespace Festa.Network
+{
+    /// <summary>
+    /// NetworkManager와 같은 오브젝트에 부착한다.
+    /// - Transport를 WebSocket으로 강제한다 (Web 빌드 필수, 데스크톱/서버도 동일 프로토콜로 통일)
+    /// - Dedicated Server 빌드/배치 모드에서 자동으로 StartServer 한다
+    /// - CLI 인자(-port, -maxPlayers)를 파싱한다 (향후 ECS Task 환경변수 대응 지점)
+    /// </summary>
+    [RequireComponent(typeof(NetworkManager))]
+    public class NetworkBootstrap : MonoBehaviour
+    {
+        [Header("Server Defaults")]
+        [SerializeField] ushort _defaultPort = 7777;
+        [SerializeField] int _maxPlayers = 100;
+
+        [Header("Transport Capacity")]
+        [Tooltip("접속 직후 spawn/외형/grant/위치 복원 버스트를 버틸 UTP 송신 큐 바이트 수")]
+        [SerializeField] int _maxSendQueueSize = DefaultMaxSendQueueSize;
+
+        public int MaxPlayers => _maxPlayers;
+
+        /// <summary>NGO 비분할 메시지 상한(바이트). 연결 요청 payload(회원 grant 1.1 KB + JSON)가 들어가야 한다 (S15P21A604-457).</summary>
+        public const int ConnectionRequestMtu = 4096;
+
+        /// <summary>
+        /// Production 에서 3명 동시 입장만으로도 기본 송신 큐가 포화됐다(GitLab #265).
+        /// 연결당 4 KB MTU 메시지와 spawn/외형 동기화가 한 틱에 겹치는 상황에 256개 패킷
+        /// 여유를 주는 1 MiB를 기본값으로 사용한다.
+        /// </summary>
+        public const int DefaultMaxSendQueueSize = 1024 * 1024;
+        const int MinMaxSendQueueSize = 64 * 1024;
+        const int MaxMaxSendQueueSize = 16 * 1024 * 1024;
+
+        void Start()
+        {
+            var transport = NetworkManager.Singleton.GetComponent<UnityTransport>();
+
+            // 브라우저는 UDP 소켓을 열 수 없으므로 WebSocket을 모든 환경에서 강제한다.
+            // 배포 시 브라우저는 wss:// → ALB(TLS 종료) → ws:// 서버 순서로 연결된다.
+            transport.UseWebSockets = true;
+
+            // MaxPacketQueueSize는 수신/이벤트 패킷 개수이고, 이 값은 UTP가 아직 전송하지 못한
+            // 바이트 큐다. Production 로그의 "send queue full"은 후자이므로 별도로 올려야 한다.
+            // 시작 뒤에는 이미 첫 연결 버스트가 큐에 들어갈 수 있어 반드시 Start* 전에 적용한다.
+            _maxSendQueueSize = ResolveMaxSendQueueSize(_maxSendQueueSize);
+            transport.MaxSendQueueSize = _maxSendQueueSize;
+            Debug.Log($"[NetworkBootstrap] UTP MaxSendQueueSize={transport.MaxSendQueueSize} B " +
+                      $"({transport.MaxSendQueueSize / 1024f:F0} KiB) — 접속 버스트 보호 (S15P21A604-966 / GitLab #265)");
+
+            // 연결 요청(ConnectionData)은 분할되지 않는 메시지라 NGO 의 MTU(기본 1,296 → payload 약 1,114 B)가 상한이다.
+            // Spring 의 회원 grant 는 1,094자(avatarCode 클레임 411자 포함)여서 JSON payload 가 1,172 B — 회원은 접속조차
+            // 못 했다(OverflowException, 2026-09-06 실측, S15P21A604-457 / T-125). 4,096 으로 올린다 — UnityTransport 는
+            // 자기 MTU 를 넘는 payload 를 스스로 분할·재조립하므로(FragmentationPipelineStage) 서버가 옛 이미지여도 받는다.
+            // 값은 8 의 배수로 내림된다. MessageManager 는 Start* 안(Initialize)에서 만들어지므로 그 전에 대면 NRE —
+            // Start* 끝에 오는 OnClientStarted/OnServerStarted 에서 대면 전송 연결(→ 연결 요청 송신)보다 앞선다.
+            NetworkManager.Singleton.OnClientStarted += ApplyConnectionRequestMtu;
+            NetworkManager.Singleton.OnServerStarted += ApplyConnectionRequestMtu;
+
+            // 자동 시작 조건 — **에디터에서는 자동으로 서버가 되지 않는다.**
+            //
+            // 전에는 `#if UNITY_SERVER` 만 보고 시작했는데, 빌드 타깃을 Dedicated Server 로
+            // 두면 그 심볼이 **에디터에도 정의된다.** 그러면 Play 를 누르는 순간 에디터가
+            // 서버가 되고, 로비에서 넘어온 핸드오프가 같은 NetworkManager 에 StartClient 를
+            // 걸어 "Failed to connect to server." 로 끝난다 — 원인이 전혀 드러나지 않는
+            // 형태였다 (T-182). 에디터에서 서버를 띄우려면 DevConnectionHud 의
+            // "Start Server" 버튼이나 `-server` 인자를 쓴다.
+            //
+            // ⚠ 그 수정이 만든 두 번째 함정 (T-202, 2026-08-25):
+            // `!Application.isEditor` 는 **모든 플레이어 빌드**를 서버로 만든다 — 브라우저
+            // (WebGL)와 부하 테스트 봇까지. 봇은 자기 자신이 서버로 떠서 StartClient 가
+            // 전부 실패했고, 원인이 로그 없이는 보이지 않았다.
+            //   · WebGL: 브라우저는 소켓을 열 수 없어 서버가 될 수 없다 — 항상 클라이언트다.
+            //   · 봇(-bot): 클라이언트로만 붙어야 트래픽 모양이 실제 사용자와 같다.
+            bool botMode = HasArg("-bot");
+            bool isRealServerBuild = !Application.isEditor;
+#if UNITY_WEBGL
+            isRealServerBuild = false;
+#endif
+            if (!botMode && (isRealServerBuild || Application.isBatchMode || HasArg("-server")))
+            {
+                StartDedicatedServer(transport);
+                return;
+            }
+
+            Debug.Log(botMode
+                ? "[NetworkBootstrap] 봇 모드 — 서버로 뜨지 않는다. LoadTestBot 이 클라이언트로 접속한다."
+                : "[NetworkBootstrap] 자동 시작하지 않는다 — DevConnectionHud 로 Host/Server/Client 를 고른다.");
+        }
+
+        static void ApplyConnectionRequestMtu()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null) return;
+            try
+            {
+                if (nm.MaximumTransmissionUnitSize >= ConnectionRequestMtu) return;
+                nm.MaximumTransmissionUnitSize = ConnectionRequestMtu;
+                Debug.Log($"[NetworkBootstrap] 비분할 메시지 상한 {ConnectionRequestMtu} B — 회원 grant(1.1 KB) 연결 요청 수용 (S15P21A604-457)");
+            }
+            catch (Exception ex)
+            {
+                // 여기서 실패하면 회원 접속이 T-125 로 되돌아간다 — 조용히 넘기지 않는다.
+                Debug.LogError($"[NetworkBootstrap] MTU 설정 실패: {ex.Message}");
+            }
+        }
+
+        void StartDedicatedServer(UnityTransport transport)
+        {
+            // 소켓을 열기 **전에** 입장 검증 준비를 확인한다 (spec infra-003 world-entry-token.md).
+            // 키가 없으면 여기서 프로세스를 끝낸다 — 검증 없이 뜬 서버는 아무나 들어온다.
+            // 원장을 못 쓰면 뜨긴 하되 모든 입장이 fail-closed 로 거부되고, 그 사실을 로그로 드러낸다.
+            WorldEntryTokenSecret.EnforceOrQuit();
+            GrantReplayLedger.Warmup();
+
+            ushort port = GetArgValue("-port", _defaultPort);
+            // 우선순위: CLI 인자 > WORLD_MAX_PLAYERS 환경변수 > 인스펙터 기본값.
+            //
+            // **환경변수를 읽는 이유.** 인프라 compose 는 예전부터 WORLD_MAX_PLAYERS 를 컨테이너에
+            // 넣고 있었는데(unity-server·environments·deploy 셋 다), 여기서 CLI 인자만 읽어서
+            // 그 값이 아무 데도 쓰이지 않았다 — compose 의 command 재정의가 없으므로 실제로 적용된
+            // 값은 Dockerfile CMD 의 -maxPlayers 였다. 정원을 바꾸려면 이미지를 다시 구워야 했다는
+            // 뜻이다. env 를 읽게 해 두면 인프라가 이미지를 건드리지 않고 정원을 조정할 수 있다
+            // (Dockerfile 주석의 "향후 ECS Task 환경변수와 연동되는 지점" 이 여기다).
+            _maxPlayers = ResolveMaxPlayers(_maxPlayers);
+
+            // 0.0.0.0: 컨테이너 내부에서 모든 인터페이스 바인딩
+            transport.SetConnectionData("0.0.0.0", port, "0.0.0.0");
+
+            bool ok = NetworkManager.Singleton.StartServer();
+            Debug.Log($"[NetworkBootstrap] Dedicated server start={ok} port={port} maxPlayers={_maxPlayers} (WebSocket)");
+        }
+
+        static bool HasArg(string name)
+        {
+            foreach (var arg in Environment.GetCommandLineArgs())
+                if (string.Equals(arg, name, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        static ushort GetArgValue(string name, ushort fallback)
+        {
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+                if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase) &&
+                    ushort.TryParse(args[i + 1], out var value))
+                    return value;
+            return fallback;
+        }
+
+        /// <summary>
+        /// 정원을 정한다. CLI 인자가 최우선이고, 없으면 <c>WORLD_MAX_PLAYERS</c> 환경변수, 그것도
+        /// 없으면 인스펙터 값이다. 값이 이상하면(0 이하·숫자 아님) 그 사실을 로그로 드러내고
+        /// 기본값을 쓴다 — 조용히 0 으로 떨어지면 아무도 못 들어오는 서버가 된다.
+        /// </summary>
+        static int ResolveMaxPlayers(int fallback)
+        {
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+                if (string.Equals(args[i], "-maxPlayers", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(args[i + 1], out var cli) && cli > 0) return cli;
+                    Debug.LogWarning($"[NetworkBootstrap] -maxPlayers 값이 올바르지 않다 ('{args[i + 1]}') — 무시한다.");
+                    break;
+                }
+
+            var env = Environment.GetEnvironmentVariable("WORLD_MAX_PLAYERS");
+            if (!string.IsNullOrWhiteSpace(env))
+            {
+                if (int.TryParse(env, out var fromEnv) && fromEnv > 0) return fromEnv;
+                Debug.LogWarning($"[NetworkBootstrap] WORLD_MAX_PLAYERS 값이 올바르지 않다 ('{env}') — 무시한다.");
+            }
+            return fallback;
+        }
+
+        /// <summary>
+        /// 송신 큐 크기를 정한다. CLI <c>-maxSendQueueSize</c>가 최우선이고,
+        /// <c>WORLD_MAX_SEND_QUEUE_SIZE</c>, 인스펙터 기본값 순서다. 단위는 바이트다.
+        /// 오타로 지나치게 작거나 큰 값을 넣으면 큐 포화 또는 메모리 폭증이 생기므로 범위를 제한한다.
+        /// </summary>
+        static int ResolveMaxSendQueueSize(int fallback)
+        {
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (!string.Equals(args[i], "-maxSendQueueSize", StringComparison.OrdinalIgnoreCase)) continue;
+                if (TryValidateSendQueueSize(args[i + 1], out int cli)) return cli;
+                Debug.LogWarning($"[NetworkBootstrap] -maxSendQueueSize 값이 올바르지 않다 ('{args[i + 1]}') — " +
+                                 $"{MinMaxSendQueueSize}~{MaxMaxSendQueueSize} B 범위여야 한다. 기본값을 쓴다.");
+                break;
+            }
+
+            string env = Environment.GetEnvironmentVariable("WORLD_MAX_SEND_QUEUE_SIZE");
+            if (!string.IsNullOrWhiteSpace(env))
+            {
+                if (TryValidateSendQueueSize(env, out int fromEnv)) return fromEnv;
+                Debug.LogWarning($"[NetworkBootstrap] WORLD_MAX_SEND_QUEUE_SIZE 값이 올바르지 않다 ('{env}') — " +
+                                 $"{MinMaxSendQueueSize}~{MaxMaxSendQueueSize} B 범위여야 한다. 기본값을 쓴다.");
+            }
+
+            if (fallback >= MinMaxSendQueueSize && fallback <= MaxMaxSendQueueSize) return fallback;
+            Debug.LogWarning($"[NetworkBootstrap] Inspector MaxSendQueueSize={fallback} B가 범위를 벗어났다 — " +
+                             $"기본 {DefaultMaxSendQueueSize} B를 쓴다.");
+            return DefaultMaxSendQueueSize;
+        }
+
+        static bool TryValidateSendQueueSize(string raw, out int value)
+        {
+            return int.TryParse(raw, out value) &&
+                   value >= MinMaxSendQueueSize && value <= MaxMaxSendQueueSize;
+        }
+    }
+}

@@ -1,0 +1,103 @@
+/* World HUD — 화면 고정 최소 안내. World 를 가리지 않는 것이 1원칙(hud-decisions §11). */
+.world-hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  font-family: 'Pretendard', 'Noto Sans KR', 'Malgun Gothic', system-ui, sans-serif;
+  color: #eaeefb;
+  z-index: var(--festa-z-world-hud);
+}
+.world-hud > * { pointer-events: auto; }
+
+/* 조작 안내 상시 카드는 2026-09-16 에 걷었다 — 목록은 ESC 메뉴의 조작 안내 오버레이가 그린다.
+   항목 배지 스타일(.world-hud-keys·.world-key)은 그 오버레이가 그대로 쓰므로 아래에 남긴다. */
+
+.world-hud-keys { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.world-hud-keys li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: rgba(234, 238, 251, 0.82);
+}
+.world-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.14);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #fff;
+}
+.world-hud-note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: rgba(234, 238, 251, 0.6);
+}
+
+/* 조작 안내 오버레이(ESC 메뉴) — 그룹 헤더 아래 2열 배치. 420px 프레임 안에서
+   [W][A][S][D] 이동 같은 넓은 항목도 한 칸에 들어오도록 minmax(0,1fr) 로 둔다. */
+.cg-root { display: flex; flex-direction: column; gap: 18px; }
+.cg-group { margin: 0; }
+.cg-title {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: rgba(234, 238, 251, 0.55);
+}
+.cg-group .world-hud-keys {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+}
+
+/* HUD 버튼 공통 규격 — 전체화면·미션·조작안내가 크기·모서리·테두리·배경을 공유한다.
+   자리만 각 클래스가 left/right/bottom 으로 잡는다(S15P21A604-911 리팩터). */
+.world-hud-control {
+  position: absolute;
+  top: var(--festa-hud-margin-y);
+  width: var(--festa-control-size);
+  height: var(--festa-control-size);
+  display: grid;
+  place-items: center;
+  /* 상담 버튼과 같은 모서리 반경을 쓴다 — 한 줄에 원형과 사각형이 섞이면 둘이 다른 종류로 보인다 */
+  border-radius: var(--festa-control-radius);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(12, 16, 34, 0.72);
+  backdrop-filter: blur(8px);
+  color: #eaeefb;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.world-hud-control svg { width: 48%; height: 48%; }
+.world-hud-control:hover { background: rgba(20, 26, 52, 0.85); }
+.world-hud-control:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.9); outline-offset: 2px; }
+.world-hud-missions { left: var(--festa-hud-margin-x); }
+.world-hud-fullscreen {
+  /* 전체화면 토글 (S15P21A604-733). 상담 퀵액세스와 우상단 한 줄에 나란히 서고, 오른쪽 끝은
+     이 버튼이 쓴다 — 상담이 왼쪽 칸이다(2026-09-16). */
+  right: var(--festa-hud-margin-x);
+}
+/* 조작 안내 버튼 — 전체화면과 같은 규격(.world-hud-control)이고 자리만 우하단이다.
+   top 을 auto 로 끊지 않으면 base 의 top 이 이긴다.
+
+   `right` 를 여기서 직접 적는다. -911 리팩터 전에는 이 버튼이 `.world-hud-fullscreen` 을 함께
+   달아 그쪽 `right` 를 빌려 썼는데, 공통 규격을 `.world-hud-control` 로 빼면서 클래스가 갈렸고
+   그때 이 한 줄이 같이 떨어져 나갔다. 가로 자리를 아무도 안 정하면 absolute 요소는 static 위치,
+   즉 **왼쪽 끝**으로 간다 — 화면에서는 채팅 위를 덮는 모양이 된다. */
+.world-hud-guide {
+  right: var(--festa-hud-margin-x);
+  top: auto;
+  bottom: var(--festa-hud-margin-y);
+}
+@media (prefers-reduced-transparency: reduce) {
+  .world-hud-control { background: #10142a; backdrop-filter: none; }
+}
+
